@@ -778,7 +778,10 @@ robj *rdbLoadStreamCompat(rio *rdb, sds key, int *error, int rdbtype) {
     if (rdbtype == RDB_TYPE_STREAM_LISTPACKS_2 ||
         rdbtype == RDB_TYPE_STREAM_LISTPACKS_3) {
         for (int i = 0; i < 5; i++) {
-            if (rdbLoadLen(rdb, NULL) == RDB_LENERR) {
+            /* UINT64_MAX is valid metadata (e.g. an empty stream's first ID),
+             * so distinguish read errors from values using the status API. */
+            uint64_t ignored;
+            if (rdbLoadLenByRef(rdb, NULL, &ignored) == -1) {
                 serverLog(LL_WARNING, "RDB compatibility: Failed to load extended stream metadata for key=%s", key);
                 decrRefCount(o);
                 return NULL;
@@ -822,7 +825,9 @@ robj *rdbLoadStreamCompat(rio *rdb, sds key, int *error, int rdbtype) {
         /* Stream type 19 added the consumer group's entries-read counter. */
         if (rdbtype == RDB_TYPE_STREAM_LISTPACKS_2 ||
             rdbtype == RDB_TYPE_STREAM_LISTPACKS_3) {
-            if (rdbLoadLen(rdb, NULL) == RDB_LENERR) {
+            /* An unknown entries-read counter is serialized as UINT64_MAX. */
+            uint64_t ignored;
+            if (rdbLoadLenByRef(rdb, NULL, &ignored) == -1) {
                 serverLog(LL_WARNING, "RDB compatibility: Failed to load consumer group offset for stream key=%s", key);
                 sdsfree(cgname);
                 decrRefCount(o);
