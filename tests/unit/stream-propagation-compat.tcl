@@ -68,6 +68,51 @@ start_server {tags {"stream downgrade"}} {
         assert_equal {1 0} [lmap item [r XINFO CONSUMERS stream group] {dict get $item pending}]
     }
 
+    foreach removal {delete trim} {
+        foreach options {{} FORCE JUSTID {FORCE JUSTID}} {
+            test "XCLAIM cleans $removal tombstones before idle checks ($options)" {
+                r DEL claim
+                r XADD claim 1-0 field one
+                r XADD claim 2-0 field two
+                r XGROUP CREATE claim group 0
+                r XREADGROUP GROUP group old STREAMS claim >
+                if {$removal eq "delete"} {
+                    r XDEL claim 1-0
+                } else {
+                    r XTRIM claim MAXLEN 1
+                }
+                assert_equal {} [r XCLAIM claim group new 999999999 1-0 1-0 999-0 {*}$options]
+                assert_equal {new old} [lmap item [r XINFO CONSUMERS claim group] {dict get $item name}]
+                assert_equal {0 1} [lmap item [r XINFO CONSUMERS claim group] {dict get $item pending}]
+                set pending [r XPENDING claim group - + 10]
+                assert_equal 1 [llength $pending]
+                assert_equal 2-0 [lindex $pending 0 0]
+                assert_equal old [lindex $pending 0 1]
+                assert_equal 1 [lindex $pending 0 3]
+                assert_equal 1 [r XACK claim group 2-0]
+                assert_equal 0 [r XGROUP DELCONSUMER claim group old]
+            }
+        }
+    }
+
+    test {XCLAIM retains FORCE, JUSTID, retry count, delivery time and idle semantics} {
+        r DEL claim
+        r XADD claim 1-0 field one
+        r XGROUP CREATE claim group 0
+        assert_equal {1-0} [r XCLAIM claim group old 0 1-0 999-0 FORCE JUSTID TIME 1 RETRYCOUNT 7]
+        set pending [r XPENDING claim group - + 10]
+        assert_equal 7 [lindex $pending 0 3]
+        assert {[lindex $pending 0 2] > 1000}
+        assert_equal {1-0} [r XCLAIM claim group new 0 1-0 JUSTID IDLE 0]
+        assert_equal 7 [lindex [r XPENDING claim group - + 10] 0 3]
+        assert_equal {} [r XCLAIM claim group skipped 999999999 1-0]
+        assert_equal new [lindex [r XPENDING claim group - + 10] 0 1]
+        assert_equal {{1-0 {field one}}} [r XCLAIM claim group old 0 1-0]
+        assert_equal 8 [lindex [r XPENDING claim group - + 10] 0 3]
+        assert_error ERR* {r XCLAIM claim group invalid 0 1-0 UNKNOWN}
+        assert_equal {new old skipped} [lmap item [r XINFO CONSUMERS claim group] {dict get $item name}]
+    }
+
     start_server {} {
         set primary [srv -1 client]
         set replica [srv 0 client]
@@ -100,6 +145,53 @@ start_server {tags {"stream downgrade"}} {
             assert_equal {consumer empty replicated} [lmap item [$replica XINFO CONSUMERS stream group] {dict get $item name}]
             assert_equal 0 [s 0 unexpected_error_replies]
         }
+
+        foreach mode {missing lastid deleted trimmed idle success} {
+            test "XCLAIM consumer and PEL changes replicate consistently ($mode)" {
+                $primary DEL claim
+                $primary XADD claim 1-0 field one
+                $primary XADD claim 2-0 field two
+                $primary XGROUP CREATE claim group 0
+                $primary XREADGROUP GROUP group old STREAMS claim >
+                switch $mode {
+                    missing {$primary XCLAIM claim group new 0 999-0}
+                    lastid {$primary XCLAIM claim group new 0 999-0 LASTID 1000-0}
+                    deleted {
+                        $primary XDEL claim 1-0
+                        $primary XCLAIM claim group new 999999999 1-0
+                    }
+                    trimmed {
+                        $primary XTRIM claim MAXLEN 1
+                        $primary XCLAIM claim group new 999999999 1-0 FORCE JUSTID
+                    }
+                    idle {$primary XCLAIM claim group new 999999999 1-0}
+                    success {$primary XCLAIM claim group new 0 1-0}
+                }
+                assert_equal 1 [$primary WAIT 1 5000]
+                foreach node [list $primary $replica] {
+                    assert_equal {new old} [lmap item [$node XINFO CONSUMERS claim group] {dict get $item name}]
+                }
+                assert_equal [$primary XINFO GROUPS claim] [$replica XINFO GROUPS claim]
+                set expected [$primary XPENDING claim group - + 10]
+                set actual [$replica XPENDING claim group - + 10]
+                assert_equal [lmap item $expected {list [lindex $item 0] [lindex $item 1] [lindex $item 3]}] \
+                    [lmap item $actual {list [lindex $item 0] [lindex $item 1] [lindex $item 3]}]
+                assert_equal [lmap item [$primary XINFO CONSUMERS claim group] {dict get $item pending}] \
+                    [lmap item [$replica XINFO CONSUMERS claim group] {dict get $item pending}]
+                assert_equal 0 [s 0 unexpected_error_replies]
+            }
+        }
+
+        test {Cleaned PEL and empty consumers survive promotion and RDB reload} {
+            $primary XDEL claim 1-0
+            $primary XCLAIM claim group empty 0 1-0
+            assert_equal 1 [$primary WAIT 1 5000]
+            $replica REPLICAOF NO ONE
+            $replica DEBUG RELOAD
+            assert_equal {empty new old} [lmap item [$replica XINFO CONSUMERS claim group] {dict get $item name}]
+            assert_equal {0 0 1} [lmap item [$replica XINFO CONSUMERS claim group] {dict get $item pending}]
+            assert_equal 2-0 [lindex [$replica XPENDING claim group - + 10] 0 0]
+        }
     }
 }
 
@@ -120,6 +212,22 @@ start_server {tags {"stream downgrade aof"} overrides {appendonly yes aof-use-rd
             assert_equal {0 1} [lmap item [r XINFO CONSUMERS stream group] {dict get $item pending}]
             assert_equal 2-0 [dict get [lindex [r XINFO GROUPS stream] 0] last-delivered-id]
             assert_equal 1-0 [lindex [r XPENDING stream group - + 10] 0 0]
+        }
+    }
+
+    test {Deleted PEL cleanup and new empty claim consumers survive AOF replay and rewrite} {
+        r XDEL stream 1-0
+        assert_equal {} [r XCLAIM stream group new 999999999 1-0 999-0 FORCE JUSTID LASTID 1000-0]
+        foreach rewrite {0 1} {
+            if {$rewrite} {
+                r BGREWRITEAOF
+                waitForBgrewriteaof r
+            }
+            r DEBUG LOADAOF
+            assert_equal {empty new pending} [lmap item [r XINFO CONSUMERS stream group] {dict get $item name}]
+            assert_equal {0 0 0} [lmap item [r XINFO CONSUMERS stream group] {dict get $item pending}]
+            assert_equal {} [r XPENDING stream group - + 10]
+            assert_equal 1000-0 [dict get [lindex [r XINFO GROUPS stream] 0] last-delivered-id]
         }
     }
 }

@@ -917,6 +917,20 @@ void streamPropagateGroupID(client *c, robj *key, streamCG *group, robj *groupna
     decrRefCount(argv[4]);
 }
 
+/* A claim can create a consumer without transferring any entries. No XCLAIM
+ * is emitted in that case, so persist the empty consumer independently. */
+void streamPropagateConsumerCreation(client *c, robj *key, robj *groupname, robj *consumername) {
+    robj *argv[5];
+    argv[0] = createStringObject("XGROUP",6);
+    argv[1] = createStringObject("CREATECONSUMER",14);
+    argv[2] = key;
+    argv[3] = groupname;
+    argv[4] = consumername;
+    propagate(server.xgroupCommand,c->db->id,argv,5,PROPAGATE_AOF|PROPAGATE_REPL);
+    decrRefCount(argv[0]);
+    decrRefCount(argv[1]);
+}
+
 /* Send the stream items in the specified range to the client 'c'. The range
  * the client will receive is between start and end inclusive, if 'count' is
  * non zero, no more than 'count' elements are sent.
@@ -2358,7 +2372,14 @@ void xclaimCommand(client *c) {
     }
 
     /* Do the actual claiming. */
-    streamConsumer *consumer = NULL;
+    streamConsumer *consumer = streamLookupConsumer(group,c->argv[3]->ptr,SLC_NOCREAT);
+    if (consumer == NULL) {
+        consumer = streamLookupConsumer(group,c->argv[3]->ptr,SLC_NONE);
+        streamPropagateConsumerCreation(c,c->argv[1],c->argv[2],c->argv[3]);
+        server.dirty++;
+        notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-createconsumer",
+                            c->argv[1],c->db->id);
+    }
     void *arraylenptr = addReplyDeferredLen(c);
     size_t arraylen = 0;
     for (int j = 5; j <= last_id_arg; j++) {
@@ -2371,23 +2392,27 @@ void xclaimCommand(client *c) {
         /* Lookup the ID in the group PEL. */
         streamNACK *nack = raxFind(group->pel,buf,sizeof(buf));
 
-        /* If FORCE is passed, let's check if at least the entry
-         * exists in the Stream. In such case, we'll crate a new
-         * entry in the PEL from scratch, so that XCLAIM can also
-         * be used to create entries in the PEL. Useful for AOF
-         * and replication of consumer groups. */
+        /* Valkey removes deleted entries from both PELs before considering
+         * min-idle-time or FORCE. Propagate while the old owner still exists. */
+        streamIterator myiterator;
+        streamIteratorStart(&myiterator,o->ptr,&id,&id,0);
+        int64_t numfields;
+        streamID item_id;
+        int found = streamIteratorGetID(&myiterator,&item_id,&numfields);
+        streamIteratorStop(&myiterator);
+        if (!found) {
+            if (nack != raxNotFound) {
+                streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],c->argv[j],nack);
+                propagate_last_id = 0;
+                raxRemove(group->pel,buf,sizeof(buf),NULL);
+                raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
+                streamFreeNACK(nack);
+                server.dirty++;
+            }
+            continue;
+        }
+
         if (force && nack == raxNotFound) {
-            streamIterator myiterator;
-            streamIteratorStart(&myiterator,o->ptr,&id,&id,0);
-            int64_t numfields;
-            int found = 0;
-            streamID item_id;
-            if (streamIteratorGetID(&myiterator,&item_id,&numfields)) found = 1;
-            streamIteratorStop(&myiterator);
-
-            /* Item must exist for us to create a NACK for it. */
-            if (!found) continue;
-
             /* Create the NACK. */
             nack = streamCreateNACK(NULL);
             raxInsert(group->pel,buf,sizeof(buf),nack,NULL);
@@ -2410,8 +2435,6 @@ void xclaimCommand(client *c) {
             if (nack->consumer)
                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
             /* Update the consumer and idle time. */
-            if (consumer == NULL)
-                consumer = streamLookupConsumer(group,c->argv[3]->ptr,SLC_NONE);
             nack->consumer = consumer;
             nack->delivery_time = deliverytime;
             /* Set the delivery attempts counter if given, otherwise
