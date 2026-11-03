@@ -12,6 +12,7 @@ redis-check-dump
 redis-cli
 redis-sentinel
 redis-server
+redis-listpack-test
 doc-tools
 release
 misc/*

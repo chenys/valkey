@@ -30,7 +30,7 @@
 #define LISTPACK_MIN_VALID_SIZE 7 /* Minimum valid listpack size */
 
 /* Listpack to Ziplist conversion functions */
-unsigned char *listpackToZiplist(unsigned char *lp);
+unsigned char *listpackToZiplist(unsigned char *lp, size_t size);
 int isListpackEncoded(unsigned char *data, size_t len);
 int quicklistConvertAndValidateIntegrity(unsigned char *lp, size_t size,
                                          unsigned char **zl);

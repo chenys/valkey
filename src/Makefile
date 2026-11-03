@@ -334,7 +334,7 @@ DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ
 	$(REDIS_CC) -MMD -o $@ -c $<
 
 clean:
-	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep dict-benchmark
+	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) redis-listpack-test *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep dict-benchmark
 	rm -f $(DEP)
 
 .PHONY: clean
@@ -362,6 +362,14 @@ lcov:
 test-sds: sds.c sds.h
 	$(REDIS_CC) sds.c zmalloc.c -DSDS_TEST_MAIN $(FINAL_LIBS) -o /tmp/sds_test
 	/tmp/sds_test
+
+redis-listpack-test: listpack.c listpack.h listpack_malloc.h zmalloc.c zmalloc.h testhelp.h ../tests/unit/listpack-compat-main.c .make-prerequisites
+	$(REDIS_CC) -DREDIS_TEST listpack.c zmalloc.c ../tests/unit/listpack-compat-main.c $(FINAL_LIBS) -o $@
+
+test-listpack: redis-listpack-test
+	./redis-listpack-test
+
+.PHONY: test-listpack
 
 .PHONY: lcov
 

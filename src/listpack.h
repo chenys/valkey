@@ -62,5 +62,9 @@ typedef int (*listpackValidateEntryCB)(unsigned char *p, unsigned int head_count
                                       void *userdata);
 int lpValidateIntegrity(unsigned char *lp, size_t size, int deep,
                         listpackValidateEntryCB entry_cb, void *cb_userdata);
+/* Deep-validate and expand narrow boundary backlens to the historical format.
+ * On success *lpp may be replaced (freeing the old allocation); on failure the
+ * original allocation remains owned by the caller. */
+int lpValidateAndNormalize(unsigned char **lpp, size_t size);
 
 #endif
