@@ -1785,14 +1785,15 @@ uint64_t streamDelConsumer(streamCG *cg, sds name) {
  * ----------------------------------------------------------------------- */
 
 /* XGROUP CREATE <key> <groupname> <id or $> [MKSTREAM]
- * XGROUP SETID <key> <groupname> <id or $>
+ * XGROUP SETID <key> <groupname> <id or $> [ENTRIESREAD <count>]
  * XGROUP DESTROY <key> <groupname>
  * XGROUP DELCONSUMER <key> <groupname> <consumername> */
 void xgroupCommand(client *c) {
     const char *help[] = {
 "CREATE      <key> <groupname> <id or $> [opt] -- Create a new consumer group.",
 "            option MKSTREAM: create the empty stream if it does not exist.",
-"SETID       <key> <groupname> <id or $>  -- Set the current group ID.",
+"SETID       <key> <groupname> <id or $> [ENTRIESREAD <count>]",
+"                                      -- Set the current group ID.",
 "DESTROY     <key> <groupname>            -- Remove the specified group.",
 "DELCONSUMER <key> <groupname> <consumer> -- Remove the specified consumer.",
 "HELP                                     -- Prints this help.",
@@ -1882,7 +1883,22 @@ NULL
             addReplySds(c,
                 sdsnew("-BUSYGROUP Consumer Group name already exists\r\n"));
         }
-    } else if (!strcasecmp(opt,"SETID") && c->argc == 5) {
+    } else if (!strcasecmp(opt,"SETID") && (c->argc == 5 || c->argc == 7)) {
+        /* Valkey propagates this counter even for Redis 6 XREADGROUP calls.
+         * Redis 6 has no entries_read field, but must still apply the ID. */
+        if (c->argc == 7) {
+            long long entries_read;
+            if (strcasecmp(c->argv[5]->ptr,"ENTRIESREAD")) {
+                addReplySubcommandSyntaxError(c);
+                return;
+            }
+            if (getLongLongFromObjectOrReply(c,c->argv[6],&entries_read,NULL) != C_OK)
+                return;
+            if (entries_read < -1) {
+                addReplyError(c,"value for ENTRIESREAD must be positive or -1");
+                return;
+            }
+        }
         streamID id;
         if (!strcmp(c->argv[4]->ptr,"$")) {
             id = s->last_id;
@@ -1893,6 +1909,11 @@ NULL
         addReply(c,shared.ok);
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-setid",c->argv[2],c->db->id);
+        /* Omit the discarded counter from our AOF and locally generated
+         * replication. Chained replicas still forward the upstream bytes. */
+        if (c->argc == 7)
+            rewriteClientCommandVector(c,5,c->argv[0],c->argv[1],
+                                       c->argv[2],c->argv[3],c->argv[4]);
     } else if (!strcasecmp(opt,"DESTROY") && c->argc == 4) {
         if (cg) {
             raxRemove(s->cgroups,(unsigned char*)grpname,sdslen(grpname),NULL);
