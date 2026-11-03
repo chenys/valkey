@@ -1787,6 +1787,7 @@ uint64_t streamDelConsumer(streamCG *cg, sds name) {
 /* XGROUP CREATE <key> <groupname> <id or $> [MKSTREAM]
  * XGROUP SETID <key> <groupname> <id or $> [ENTRIESREAD <count>]
  * XGROUP DESTROY <key> <groupname>
+ * XGROUP CREATECONSUMER <key> <groupname> <consumername>
  * XGROUP DELCONSUMER <key> <groupname> <consumername> */
 void xgroupCommand(client *c) {
     const char *help[] = {
@@ -1795,6 +1796,7 @@ void xgroupCommand(client *c) {
 "SETID       <key> <groupname> <id or $> [ENTRIESREAD <count>]",
 "                                      -- Set the current group ID.",
 "DESTROY     <key> <groupname>            -- Remove the specified group.",
+"CREATECONSUMER <key> <groupname> <consumer> -- Create a consumer if absent.",
 "DELCONSUMER <key> <groupname> <consumer> -- Remove the specified consumer.",
 "HELP                                     -- Prints this help.",
 NULL
@@ -1841,6 +1843,7 @@ NULL
         /* Certain subcommands require the group to exist. */
         if ((cg = streamLookupCG(s,grpname)) == NULL &&
             (!strcasecmp(opt,"SETID") ||
+             !strcasecmp(opt,"CREATECONSUMER") ||
              !strcasecmp(opt,"DELCONSUMER")))
         {
             addReplyErrorFormat(c, "-NOGROUP No such consumer group '%s' "
@@ -1926,6 +1929,19 @@ NULL
             signalKeyAsReady(c->db,c->argv[2]);
         } else {
             addReply(c,shared.czero);
+        }
+    } else if (!strcasecmp(opt,"CREATECONSUMER") && c->argc == 5) {
+        /* Replays must not reset pending entries or the existing seen time. */
+        streamConsumer *consumer = streamLookupConsumer(cg,c->argv[4]->ptr,
+                                            SLC_NOCREAT|SLC_NOREFRESH);
+        if (consumer) {
+            addReply(c,shared.czero);
+        } else {
+            streamLookupConsumer(cg,c->argv[4]->ptr,SLC_NONE);
+            server.dirty++;
+            notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-createconsumer",
+                                c->argv[2],c->db->id);
+            addReply(c,shared.cone);
         }
     } else if (!strcasecmp(opt,"DELCONSUMER") && c->argc == 5) {
         /* Delete the consumer and returns the number of pending messages
