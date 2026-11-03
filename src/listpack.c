@@ -292,7 +292,9 @@ int lpEncodeGetType(unsigned char *ele, uint32_t size, unsigned char *intenc, ui
  * of the previous element of size 'l', in the target buffer 'buf'.
  * The function returns the number of bytes used to encode it, from
  * 1 to 5. If 'buf' is NULL the function just returns the number of bytes
- * needed in order to encode the backlen. */
+ * needed in order to encode the backlen. The wider representation at the
+ * three boundary lengths is intentional for compatibility with older readers.
+ * Existing entries may use either width; see lpBacklenBytes(). */
 unsigned long lpEncodeBacklen(unsigned char *buf, uint64_t l) {
     if (l <= 127) {
         if (buf) buf[0] = l;
@@ -330,18 +332,34 @@ unsigned long lpEncodeBacklen(unsigned char *buf, uint64_t l) {
     }
 }
 
-/* Decode the backlen and returns it. If the encoding looks invalid (more than
- * 5 bytes are used), UINT64_MAX is returned to report the problem. */
-uint64_t lpDecodeBacklen(unsigned char *p) {
+/* Valkey 9.1.0 through 9.1.2 wrote a narrower backlen at these boundaries.
+ * Its first group is nonzero, unlike the historical encoding's leading zero. */
+static unsigned long lpBacklenBytes(uint64_t len, const unsigned char *backlen) {
+    unsigned long bytes = lpEncodeBacklen(NULL,len);
+    if ((len == 16383 || len == 2097151 || len == 268435455) &&
+        backlen[0] != 0) bytes--;
+    return bytes;
+}
+
+/* Decode a backlen, reporting its stored width rather than inferring it from
+ * the value. The caller must ensure the field is within a valid listpack.
+ * More than five bytes is invalid and returns UINT64_MAX. */
+static uint64_t lpDecodeBacklen(unsigned char *p, unsigned long *width) {
     uint64_t val = 0;
     uint64_t shift = 0;
+    unsigned long used = 1;
     do {
         val |= (uint64_t)(p[0] & 127) << shift;
         if (!(p[0] & 128)) break;
         shift += 7;
         p--;
-        if (shift > 28) return UINT64_MAX;
+        used++;
+        if (shift > 28) {
+            *width = used;
+            return UINT64_MAX;
+        }
     } while(1);
+    *width = used;
     return val;
 }
 
@@ -405,7 +423,7 @@ static uint32_t lpCurrentEncodedSizeBytes(unsigned char *p) {
  * it does not return NULL when the EOF element is encountered. */
 unsigned char *lpSkip(unsigned char *p) {
     unsigned long entrylen = lpCurrentEncodedSize(p);
-    entrylen += lpEncodeBacklen(NULL,entrylen);
+    entrylen += lpBacklenBytes(entrylen,p+entrylen);
     p += entrylen;
     return p;
 }
@@ -426,8 +444,9 @@ unsigned char *lpNext(unsigned char *lp, unsigned char *p) {
 unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
     if (p-lp == LP_HDR_SIZE) return NULL;
     p--; /* Seek the first backlen byte of the last element. */
-    uint64_t prevlen = lpDecodeBacklen(p);
-    prevlen += lpEncodeBacklen(NULL,prevlen);
+    unsigned long backlen_width;
+    uint64_t prevlen = lpDecodeBacklen(p,&backlen_width);
+    prevlen += backlen_width;
     return p-prevlen+1; /* Seek the first byte of the previous entry. */
 }
 
@@ -656,7 +675,7 @@ unsigned char *lpInsert(unsigned char *lp, unsigned char *ele, uint32_t size, un
     uint32_t replaced_len  = 0;
     if (where == LP_REPLACE) {
         replaced_len = lpCurrentEncodedSize(p);
-        replaced_len += lpEncodeBacklen(NULL,replaced_len);
+        replaced_len += lpBacklenBytes(replaced_len,p+replaced_len);
     }
 
     uint64_t new_listpack_bytes = old_listpack_bytes + enclen + backlen_size
@@ -783,15 +802,23 @@ static int lpValidateNext(unsigned char *lp, unsigned char **pp, size_t lpbytes)
     uint32_t lenbytes = lpCurrentEncodedSizeBytes(p);
     if (!lenbytes || lenbytes > lpbytes - offset - 1) return 0;
 
-    unsigned long entrylen = lpCurrentEncodedSize(p);
-    unsigned long encoded_backlen = lpEncodeBacklen(NULL, entrylen);
-    if (entrylen > lpbytes - offset - 1 ||
-        encoded_backlen > lpbytes - offset - entrylen - 1) {
-        return 0;
-    }
+    /* Widen before adding the 32-bit string header to avoid length overflow. */
+    uint64_t entrylen = LP_ENCODING_IS_32BIT_STR(p[0]) ?
+        5+(uint64_t)LP_ENCODING_32BIT_STR_LEN(p) : lpCurrentEncodedSize(p);
+    if (entrylen >= lpbytes - offset - 1) return 0;
+    unsigned char *backlen = p + entrylen;
+    unsigned long encoded_backlen = lpBacklenBytes(entrylen,backlen);
+    if (encoded_backlen > lpbytes - offset - entrylen - 1) return 0;
+
+    /* Bound the reverse decoder to this field, not adjacent payload bytes. */
+    if (backlen[0] & 128) return 0;
+    for (unsigned long i = 1; i < encoded_backlen; i++)
+        if (!(backlen[i] & 128)) return 0;
 
     p += entrylen + encoded_backlen;
-    if (lpDecodeBacklen(p - 1) != entrylen) return 0;
+    unsigned long decoded_width;
+    if (lpDecodeBacklen(p - 1,&decoded_width) != entrylen ||
+        decoded_width != encoded_backlen) return 0;
 
     *pp = p;
     return 1;
@@ -818,6 +845,44 @@ int lpValidateIntegrity(unsigned char *lp, size_t size, int deep,
 
     if (p != lp + size - 1) return 0;
     if (numele != LP_HDR_NUMELE_UNKNOWN && numele != count) return 0;
+    return 1;
+}
+
+/* Validate before traversing untrusted bytes. Normalize only short boundary
+ * backlens so saved data is also readable by historical Redis listpack readers.
+ * Entry encodings and the cached element count are preserved verbatim. */
+int lpValidateAndNormalize(unsigned char **lpp, size_t size) {
+    unsigned char *lp = *lpp;
+    if (!lpValidateIntegrity(lp,size,1,NULL,NULL)) return 0;
+
+    size_t extra = 0;
+    unsigned char *p = lp + LP_HDR_SIZE;
+    while (p[0] != LP_EOF) {
+        uint64_t len = lpCurrentEncodedSize(p);
+        unsigned long stored = lpBacklenBytes(len,p+len);
+        extra += lpEncodeBacklen(NULL,len) - stored;
+        p += len + stored;
+    }
+    if (!extra) return 1;
+    if (extra > UINT32_MAX - size) return 0;
+
+    unsigned char *normalized = lp_malloc(size+extra);
+    if (!normalized) return 0;
+    memcpy(normalized,lp,LP_HDR_SIZE);
+    unsigned char *dst = normalized + LP_HDR_SIZE;
+    p = lp + LP_HDR_SIZE;
+    while (p[0] != LP_EOF) {
+        uint64_t len = lpCurrentEncodedSize(p);
+        unsigned long stored = lpBacklenBytes(len,p+len);
+        memcpy(dst,p,len);
+        dst += len;
+        dst += lpEncodeBacklen(dst,len);
+        p += len + stored;
+    }
+    *dst = LP_EOF;
+    lpSetTotalBytes(normalized,size+extra);
+    lp_free(lp);
+    *lpp = normalized;
     return 1;
 }
 
@@ -869,3 +934,117 @@ unsigned char *lpSeek(unsigned char *lp, long index) {
         return ele;
     }
 }
+
+#ifdef REDIS_TEST
+/* testhelp.h defines counters, so give this suite its own names. */
+#define __failed_tests listpack_failed_tests
+#define __test_num listpack_test_num
+#include "testhelp.h"
+
+static unsigned char *lpTestCopy(unsigned char *lp) {
+    unsigned char *copy = lp_malloc(lpBytes(lp));
+    memcpy(copy,lp,lpBytes(lp));
+    return copy;
+}
+
+/* Also check that rejection leaves ownership with the caller. */
+static int lpTestRejected(unsigned char *lp, size_t size) {
+    unsigned char *original = lp;
+    int rejected = !lpValidateAndNormalize(&lp,size) && lp == original;
+    lpFree(lp);
+    return rejected;
+}
+
+int listpackTest(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    const uint32_t boundaries[] = {16383, 2097151};
+    for (unsigned int b = 0; b < sizeof(boundaries)/sizeof(boundaries[0]); b++) {
+        uint32_t len = boundaries[b];
+        unsigned char *value = lp_malloc(len-5);
+        memset(value,'x',len-5);
+        unsigned char *canonical = lpNew();
+        canonical = lpAppend(canonical,(unsigned char *)"head",4);
+        canonical = lpAppend(canonical,value,len-5);
+        canonical = lpAppend(canonical,(unsigned char *)"tail",4);
+        lp_free(value);
+        uint32_t canonical_size = lpBytes(canonical);
+
+        for (int narrow = 0; narrow <= 1; narrow++) {
+            unsigned char *lp = lpTestCopy(canonical);
+            unsigned char *entry = lpNext(lp,lpFirst(lp));
+            if (narrow) {
+                unsigned char *backlen = entry + len;
+                memmove(backlen,backlen+1,canonical_size-(backlen-lp)-1);
+                backlen[0] &= 127;
+                lpSetTotalBytes(lp,canonical_size-1);
+            }
+            printf("Boundary %u, %s backlen\n",len,narrow ? "narrow" : "historical");
+            test_cond("deep validation accepts stored width",
+                lpValidateIntegrity(lp,lpBytes(lp),1,NULL,NULL));
+            unsigned char *tail = lpNext(lp,entry);
+            int64_t slen;
+            unsigned char *str = lpGet(tail,&slen,NULL);
+            test_cond("forward traversal preserves following entry",
+                slen == 4 && !memcmp(str,"tail",4));
+            test_cond("reverse traversal uses actual width",
+                lpLast(lp) == tail && lpPrev(lp,tail) == entry &&
+                lpPrev(lp,entry) == lpFirst(lp));
+
+            unsigned char *copy = lpTestCopy(lp);
+            copy = lpInsert(copy,(unsigned char *)"new",3,
+                lpNext(copy,lpFirst(copy)),LP_REPLACE,NULL);
+            test_cond("replace preserves listpack framing",
+                lpLength(copy) == 3 &&
+                !memcmp(lpLast(copy),lpLast(canonical),6) &&
+                lpValidateIntegrity(copy,lpBytes(copy),1,NULL,NULL));
+            lpFree(copy);
+            copy = lpTestCopy(lp);
+            copy = lpDelete(copy,lpNext(copy,lpFirst(copy)),NULL);
+            test_cond("delete preserves following entry",
+                lpLength(copy) == 2 &&
+                !memcmp(lpLast(copy),lpLast(canonical),6) &&
+                lpValidateIntegrity(copy,lpBytes(copy),1,NULL,NULL) &&
+                lpNext(copy,lpFirst(copy)) == lpLast(copy));
+            lpFree(copy);
+            copy = lpTestCopy(lp);
+            /* Corrupt the first backlen group's continuation bit. */
+            lpNext(copy,lpFirst(copy))[len] |= 128;
+            test_cond("malformed backlen rejected",lpTestRejected(copy,lpBytes(copy)));
+            copy = lpTestCopy(lp);
+            uint32_t truncated_size = lpBytes(copy)-8;
+            lpSetTotalBytes(copy,truncated_size);
+            copy[truncated_size-1] = LP_EOF;
+            test_cond("truncated entry rejected",lpTestRejected(copy,truncated_size));
+
+            unsigned char *original = lp;
+            test_cond("normalization succeeds",lpValidateAndNormalize(&lp,lpBytes(lp)));
+            test_cond("normalization preserves exact canonical payload",
+                lpBytes(lp) == canonical_size &&
+                !memcmp(lp,canonical,canonical_size));
+            test_cond("historical input does not allocate",narrow || lp == original);
+            lpFree(lp);
+        }
+        lpFree(canonical);
+    }
+
+    unsigned char *lp = lp_malloc(13);
+    memset(lp,0,13);
+    lpSetTotalBytes(lp,13);
+    lpSetNumElements(lp,1);
+    lp[6] = LP_ENCODING_32BIT_STR;
+    memset(lp+7,255,4);
+    lp[12] = LP_EOF;
+    test_cond("overflowing 32-bit string framing rejected",lpTestRejected(lp,13));
+    lp = lpNew();
+    test_cond("truncated header rejected",lpTestRejected(lp,LP_HDR_SIZE-1));
+    lp = lpNew();
+    lpSetNumElements(lp,1);
+    test_cond("incorrect element count rejected",lpTestRejected(lp,lpBytes(lp)));
+    lp = lpNew();
+    lpSetTotalBytes(lp,8);
+    test_cond("incorrect total size rejected",lpTestRejected(lp,7));
+    test_report();
+    return 0;
+}
+#endif

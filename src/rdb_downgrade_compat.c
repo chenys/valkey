@@ -208,7 +208,7 @@ int isListpackEncoded(unsigned char *data, size_t len) {
 
 
 /* Convert listpack to ziplist format with comprehensive error handling */
-unsigned char *listpackToZiplist(unsigned char *lp) {
+unsigned char *listpackToZiplist(unsigned char *lp, size_t size) {
     if (!lp) {
         serverLog(LL_WARNING, "RDB compatibility: listpackToZiplist called with NULL pointer");
         return NULL;
@@ -220,10 +220,15 @@ unsigned char *listpackToZiplist(unsigned char *lp) {
         return NULL;
     }
     
-    /* Get listpack size safely */
-    size_t lp_size = lpBytes(lp);
+    /* Validate against the actual allocation before using cached lengths or
+     * walking entries. The stored backlen may use either historical width. */
+    size_t lp_size = size;
     if (lp_size > MAX_LISTPACK_SIZE || lp_size < LISTPACK_MIN_VALID_SIZE) {
         serverLog(LL_WARNING, "listpackToZiplist: invalid listpack size (%zu bytes)", lp_size);
+        return NULL;
+    }
+    if (!lpValidateIntegrity(lp, lp_size, 1, NULL, NULL)) {
+        serverLog(LL_WARNING, "listpackToZiplist: invalid listpack");
         return NULL;
     }
     
@@ -498,11 +503,14 @@ robj *rdbLoadObjectCompat(int rdbtype, rio *rdb, sds key, int *error, int rdbver
             }
             
             /* Detect and convert listpack data */
-            if (isListpackEncoded(encoded, encoded_len)) {
+            if (rdbtype == RDB_TYPE_HASH_LISTPACK ||
+                rdbtype == RDB_TYPE_ZSET_LISTPACK ||
+                rdbtype == RDB_TYPE_SET_LISTPACK ||
+                isListpackEncoded(encoded, encoded_len)) {
                 serverLog(LL_VERBOSE, "RDB compatibility: Detected listpack encoding for key=%s, type=%s, converting...", key, getDataStructureType(rdbtype));
                 
                 /* Convert listpack to ziplist */
-                unsigned char *zl = listpackToZiplist(encoded);
+                unsigned char *zl = listpackToZiplist(encoded, encoded_len);
                 if (!zl) {
                     serverLog(LL_WARNING, "RDB compatibility: Listpack to ziplist conversion failed for key=%s, type=%s", key, getDataStructureType(rdbtype));
                     goto error_cleanup;
@@ -743,8 +751,16 @@ robj *rdbLoadStreamCompat(rio *rdb, sds key, int *error, int rdbtype) {
             return NULL;
         }
         
-        /* Validate listpack */
-        
+        /* Validate before traversal, and normalize short backlens so our RDB
+         * and downstream replicas do not inherit the incompatible encoding. */
+        if (!lpValidateAndNormalize(&lp, lp_size)) {
+            serverLog(LL_WARNING, "RDB compatibility: Invalid stream listpack for key=%s", key);
+            sdsfree(nodekey);
+            zfree(lp);
+            decrRefCount(o);
+            return NULL;
+        }
+
         /* Check if listpack is empty */
         unsigned char *first = lpFirst(lp);
         if (!first) {

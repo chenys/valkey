@@ -1814,11 +1814,21 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key) {
             }
 
             /* Load the listpack. */
+            size_t lp_size;
             unsigned char *lp =
-                rdbGenericLoadStringObject(rdb,RDB_LOAD_PLAIN,NULL);
+                rdbGenericLoadStringObject(rdb,RDB_LOAD_PLAIN,&lp_size);
             if (lp == NULL) {
                 rdbReportReadError("Stream listpacks loading failed.");
                 sdsfree(nodekey);
+                decrRefCount(o);
+                return NULL;
+            }
+            /* Version 9 / type 15 payloads may also contain short backlens.
+             * Validate and normalize before any native stream traversal. */
+            if (!lpValidateAndNormalize(&lp, lp_size)) {
+                rdbReportReadError("Stream listpack integrity check failed.");
+                sdsfree(nodekey);
+                zfree(lp);
                 decrRefCount(o);
                 return NULL;
             }
