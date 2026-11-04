@@ -1276,14 +1276,27 @@ int rewriteStreamObject(rio *r, robj *key, robj *o) {
                 return 0;
             }
 
-            /* Generate XCLAIMs for each consumer that happens to
-             * have pending entries. Empty consumers have no semantical
-             * value so they are discarded. */
+            /* Preserve empty consumers too: Valkey can propagate their
+             * creation independently of pending entries. */
             raxIterator ri_cons;
             raxStart(&ri_cons,group->consumers);
             raxSeek(&ri_cons,"^",NULL,0);
             while(raxNext(&ri_cons)) {
                 streamConsumer *consumer = ri_cons.data;
+                if (raxSize(consumer->pel) == 0) {
+                    if (!rioWriteBulkCount(r,'*',5) ||
+                        !rioWriteBulkString(r,"XGROUP",6) ||
+                        !rioWriteBulkString(r,"CREATECONSUMER",14) ||
+                        !rioWriteBulkObject(r,key) ||
+                        !rioWriteBulkString(r,(char*)ri.key,ri.key_len) ||
+                        !rioWriteBulkString(r,consumer->name,sdslen(consumer->name)))
+                    {
+                        raxStop(&ri_cons);
+                        raxStop(&ri);
+                        streamIteratorStop(&si);
+                        return 0;
+                    }
+                }
                 /* For the current consumer, iterate all the PEL entries
                  * to emit the XCLAIM protocol. */
                 raxIterator ri_pel;

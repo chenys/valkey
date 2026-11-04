@@ -231,24 +231,24 @@ start_server {
 
         # Delete item 2 from the stream. Now client 1 has PEL that contains
         # only item 3. Try to use client 2 to claim the deleted item 2
-        # from the PEL of client 1, this should return nil
+        # from the PEL of client 1: remove it without returning a message.
         r XDEL mystream $id2
         set reply [
             r XCLAIM mystream mygroup client2 10 $id2
         ]
-        assert {[llength $reply] == 1}
-        assert_equal "" [lindex $reply 0]
+        assert_equal {} $reply
+        assert_equal {} [r XPENDING mystream mygroup $id2 $id2 1]
 
         # Delete item 3 from the stream. Now client 1 has PEL that is empty.
         # Try to use client 2 to claim the deleted item 3 from the PEL
-        # of client 1, this should return nil
+        # of client 1: remove it without returning a message.
         r debug sleep 0.2
         r XDEL mystream $id3
         set reply [
             r XCLAIM mystream mygroup client2 10 $id3
         ]
-        assert {[llength $reply] == 1}
-        assert_equal "" [lindex $reply 0]
+        assert_equal {} $reply
+        assert_equal {} [r XPENDING mystream mygroup - + 10 client1]
     }
 
     test {XCLAIM without JUSTID increments delivery count} {

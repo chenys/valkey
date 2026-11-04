@@ -917,6 +917,20 @@ void streamPropagateGroupID(client *c, robj *key, streamCG *group, robj *groupna
     decrRefCount(argv[4]);
 }
 
+/* A claim can create a consumer without transferring any entries. No XCLAIM
+ * is emitted in that case, so persist the empty consumer independently. */
+void streamPropagateConsumerCreation(client *c, robj *key, robj *groupname, robj *consumername) {
+    robj *argv[5];
+    argv[0] = createStringObject("XGROUP",6);
+    argv[1] = createStringObject("CREATECONSUMER",14);
+    argv[2] = key;
+    argv[3] = groupname;
+    argv[4] = consumername;
+    propagate(server.xgroupCommand,c->db->id,argv,5,PROPAGATE_AOF|PROPAGATE_REPL);
+    decrRefCount(argv[0]);
+    decrRefCount(argv[1]);
+}
+
 /* Send the stream items in the specified range to the client 'c'. The range
  * the client will receive is between start and end inclusive, if 'count' is
  * non zero, no more than 'count' elements are sent.
@@ -1785,15 +1799,18 @@ uint64_t streamDelConsumer(streamCG *cg, sds name) {
  * ----------------------------------------------------------------------- */
 
 /* XGROUP CREATE <key> <groupname> <id or $> [MKSTREAM]
- * XGROUP SETID <key> <groupname> <id or $>
+ * XGROUP SETID <key> <groupname> <id or $> [ENTRIESREAD <count>]
  * XGROUP DESTROY <key> <groupname>
+ * XGROUP CREATECONSUMER <key> <groupname> <consumername>
  * XGROUP DELCONSUMER <key> <groupname> <consumername> */
 void xgroupCommand(client *c) {
     const char *help[] = {
 "CREATE      <key> <groupname> <id or $> [opt] -- Create a new consumer group.",
 "            option MKSTREAM: create the empty stream if it does not exist.",
-"SETID       <key> <groupname> <id or $>  -- Set the current group ID.",
+"SETID       <key> <groupname> <id or $> [ENTRIESREAD <count>]",
+"                                      -- Set the current group ID.",
 "DESTROY     <key> <groupname>            -- Remove the specified group.",
+"CREATECONSUMER <key> <groupname> <consumer> -- Create a consumer if absent.",
 "DELCONSUMER <key> <groupname> <consumer> -- Remove the specified consumer.",
 "HELP                                     -- Prints this help.",
 NULL
@@ -1840,6 +1857,7 @@ NULL
         /* Certain subcommands require the group to exist. */
         if ((cg = streamLookupCG(s,grpname)) == NULL &&
             (!strcasecmp(opt,"SETID") ||
+             !strcasecmp(opt,"CREATECONSUMER") ||
              !strcasecmp(opt,"DELCONSUMER")))
         {
             addReplyErrorFormat(c, "-NOGROUP No such consumer group '%s' "
@@ -1882,7 +1900,22 @@ NULL
             addReplySds(c,
                 sdsnew("-BUSYGROUP Consumer Group name already exists\r\n"));
         }
-    } else if (!strcasecmp(opt,"SETID") && c->argc == 5) {
+    } else if (!strcasecmp(opt,"SETID") && (c->argc == 5 || c->argc == 7)) {
+        /* Valkey propagates this counter even for Redis 6 XREADGROUP calls.
+         * Redis 6 has no entries_read field, but must still apply the ID. */
+        if (c->argc == 7) {
+            long long entries_read;
+            if (strcasecmp(c->argv[5]->ptr,"ENTRIESREAD")) {
+                addReplySubcommandSyntaxError(c);
+                return;
+            }
+            if (getLongLongFromObjectOrReply(c,c->argv[6],&entries_read,NULL) != C_OK)
+                return;
+            if (entries_read < -1) {
+                addReplyError(c,"value for ENTRIESREAD must be positive or -1");
+                return;
+            }
+        }
         streamID id;
         if (!strcmp(c->argv[4]->ptr,"$")) {
             id = s->last_id;
@@ -1893,6 +1926,11 @@ NULL
         addReply(c,shared.ok);
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-setid",c->argv[2],c->db->id);
+        /* Omit the discarded counter from our AOF and locally generated
+         * replication. Chained replicas still forward the upstream bytes. */
+        if (c->argc == 7)
+            rewriteClientCommandVector(c,5,c->argv[0],c->argv[1],
+                                       c->argv[2],c->argv[3],c->argv[4]);
     } else if (!strcasecmp(opt,"DESTROY") && c->argc == 4) {
         if (cg) {
             raxRemove(s->cgroups,(unsigned char*)grpname,sdslen(grpname),NULL);
@@ -1905,6 +1943,19 @@ NULL
             signalKeyAsReady(c->db,c->argv[2]);
         } else {
             addReply(c,shared.czero);
+        }
+    } else if (!strcasecmp(opt,"CREATECONSUMER") && c->argc == 5) {
+        /* Replays must not reset pending entries or the existing seen time. */
+        streamConsumer *consumer = streamLookupConsumer(cg,c->argv[4]->ptr,
+                                            SLC_NOCREAT|SLC_NOREFRESH);
+        if (consumer) {
+            addReply(c,shared.czero);
+        } else {
+            streamLookupConsumer(cg,c->argv[4]->ptr,SLC_NONE);
+            server.dirty++;
+            notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-createconsumer",
+                                c->argv[2],c->db->id);
+            addReply(c,shared.cone);
         }
     } else if (!strcasecmp(opt,"DELCONSUMER") && c->argc == 5) {
         /* Delete the consumer and returns the number of pending messages
@@ -2321,7 +2372,14 @@ void xclaimCommand(client *c) {
     }
 
     /* Do the actual claiming. */
-    streamConsumer *consumer = NULL;
+    streamConsumer *consumer = streamLookupConsumer(group,c->argv[3]->ptr,SLC_NOCREAT);
+    if (consumer == NULL) {
+        consumer = streamLookupConsumer(group,c->argv[3]->ptr,SLC_NONE);
+        streamPropagateConsumerCreation(c,c->argv[1],c->argv[2],c->argv[3]);
+        server.dirty++;
+        notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-createconsumer",
+                            c->argv[1],c->db->id);
+    }
     void *arraylenptr = addReplyDeferredLen(c);
     size_t arraylen = 0;
     for (int j = 5; j <= last_id_arg; j++) {
@@ -2334,23 +2392,27 @@ void xclaimCommand(client *c) {
         /* Lookup the ID in the group PEL. */
         streamNACK *nack = raxFind(group->pel,buf,sizeof(buf));
 
-        /* If FORCE is passed, let's check if at least the entry
-         * exists in the Stream. In such case, we'll crate a new
-         * entry in the PEL from scratch, so that XCLAIM can also
-         * be used to create entries in the PEL. Useful for AOF
-         * and replication of consumer groups. */
+        /* Valkey removes deleted entries from both PELs before considering
+         * min-idle-time or FORCE. Propagate while the old owner still exists. */
+        streamIterator myiterator;
+        streamIteratorStart(&myiterator,o->ptr,&id,&id,0);
+        int64_t numfields;
+        streamID item_id;
+        int found = streamIteratorGetID(&myiterator,&item_id,&numfields);
+        streamIteratorStop(&myiterator);
+        if (!found) {
+            if (nack != raxNotFound) {
+                streamPropagateXCLAIM(c,c->argv[1],group,c->argv[2],c->argv[j],nack);
+                propagate_last_id = 0;
+                raxRemove(group->pel,buf,sizeof(buf),NULL);
+                raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
+                streamFreeNACK(nack);
+                server.dirty++;
+            }
+            continue;
+        }
+
         if (force && nack == raxNotFound) {
-            streamIterator myiterator;
-            streamIteratorStart(&myiterator,o->ptr,&id,&id,0);
-            int64_t numfields;
-            int found = 0;
-            streamID item_id;
-            if (streamIteratorGetID(&myiterator,&item_id,&numfields)) found = 1;
-            streamIteratorStop(&myiterator);
-
-            /* Item must exist for us to create a NACK for it. */
-            if (!found) continue;
-
             /* Create the NACK. */
             nack = streamCreateNACK(NULL);
             raxInsert(group->pel,buf,sizeof(buf),nack,NULL);
@@ -2373,8 +2435,6 @@ void xclaimCommand(client *c) {
             if (nack->consumer)
                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
             /* Update the consumer and idle time. */
-            if (consumer == NULL)
-                consumer = streamLookupConsumer(group,c->argv[3]->ptr,SLC_NONE);
             nack->consumer = consumer;
             nack->delivery_time = deliverytime;
             /* Set the delivery attempts counter if given, otherwise
